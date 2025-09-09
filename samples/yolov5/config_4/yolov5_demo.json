@@ -1,0 +1,16 @@
+{
+  "channels": [
+    {
+      "channel_id": 2,
+      "url": "/data/test2.mp4",
+      "source_type": "VIDEO",
+      "sample_interval": 1,
+      "loop_num": 1,
+      "fps": 25
+    }
+  ],
+  "class_names": "../yolov5/coco.names",
+  "download_image": false,
+  "draw_func_name": "draw_yolov5_results",
+  "engine_config_path": "../yolov5/config_4/engine_group.json"
+}

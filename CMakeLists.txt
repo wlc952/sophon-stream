@@ -53,6 +53,7 @@ checkAndAddElement(element/tools/blank)
 checkAndAddElement(element/tools/distributor)
 checkAndAddElement(element/tools/converger)
 checkAndAddElement(element/tools/http_push)
+checkAndAddElement(element/tools/save_video)
 checkAndAddElement(element/tools/faiss)
 
 checkAndAddElement(element/tools/dwa)
