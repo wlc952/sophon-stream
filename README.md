@@ -1,10 +1,67 @@
-# sophon-stream
+# sophon-stream 视频检测项目说明
 
-## 1 快速开始**配置文件修改：**
+## 1.下载项目文件（本地已有可跳过）
+
+从网盘下载压缩包：
+链接:[https://pan.baidu.com/s/11Ig7jAY9wxbdm8uh1Og4Hg?pwd=edwb](https://pan.baidu.com/s/11Ig7jAY9wxbdm8uh1Og4Hg?pwd=edwb) 提取码:edwb
+
+## 2.解压到/data目录
+
+unzip解压所有压缩包，请确认最终的目录结构应该为：
+
+```sh
+/data/sophon-stream  # 核心项目
+/data/8models        # 测试模型
+/data/test2.mp4      # 测试视频
+```
+
+## 3.开始测试
+
+### 3.1启动nginx文件服务器
+
+```sh
+cd /data/sophon-stream
+```
+
+在目录下应该可以看到 `nginx_setup.sh`和 `nginx.conf`两个文件，执行下面命令：
+
+```sh
+chmod +x nginx_setup.sh
+./nginx_setup.sh
+```
+
+### 3.2启动测试
+
+```sh
+cd /data/sophon-stream
+```
+
+在目录下应该可以看到 `run.sh`文件，执行下面的命令：
+
+```sh
+chmod +x run.sh
+./run.sh
+```
+
+`run.sh`是根据需求一次运行8个模型检测任务，可使用下面的命令运行单个：
+
+```sh
+echo 'export LD_LIBRARY_PATH=/data/sophon-stream/build/lib/:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+cd /data/sophon-stream/samples/build
+./main --demo_config_path=../yolov5/config_2/yolov5_demo.json
+```
+
+### 3.3查看运行数据
+
+可以查看盒子的文件夹 `/data/alarms/`；也可以浏览器访问nginx的网页：`http://盒子ip/static/`
+
+## 4. 配置文件修改
 
 在 `samples/yolov5` 目录下有多个config文件夹如 `config_1`，对于不同模型。
 
-在 `samples/yolov5/config_1/yolov5_demo.json` 修改输入源，
+在 `samples/yolov5/config_1/yolov5_demo.json` 修改输入源，修改url为真实的rtsp源，对应修改source_type等。
 
 ```json
 {
@@ -82,18 +139,12 @@
 }
 ```
 
-**配置nginx：**
-
-```bash
-./nginx_setup.sh
-```
-
-**启动****：**
+重新启动：
 
 ```bash
 ./run.sh
 ```
 
-## 2 文档
+## 5 文档
 
 请参考[sophon-stream用户文档](./docs/Sophon_Stream_User_Guide.md)
