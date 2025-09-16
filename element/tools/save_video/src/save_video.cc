@@ -62,7 +62,10 @@ bool SaveVideo::saveSnapshot(const common::Frame& frame, const std::string& file
   try {
     fs::create_directories(fs::path(filepath).parent_path());
     cv::Mat img;
-    if (frame.mSpData) {
+    // 优先使用已绘制 OSD 的图像
+    if (frame.mSpDataOsd) {
+      cv::bmcv::toMAT(frame.mSpDataOsd.get(), img, true);
+    } else if (frame.mSpData) {
       cv::bmcv::toMAT(frame.mSpData.get(), img, true);
     } else if (!frame.mMat.empty()) {
       img = frame.mMat;
@@ -113,7 +116,10 @@ void SaveVideo::appendFrame(int channel, const common::Frame& frame) {
   auto& st = it->second;
   if (!st.recording || !st.writer) return;
   cv::Mat img;
-  if (frame.mSpData) {
+  // 优先写入 OSD 后的图像
+  if (frame.mSpDataOsd) {
+    cv::bmcv::toMAT(frame.mSpDataOsd.get(), img, true);
+  } else if (frame.mSpData) {
     cv::bmcv::toMAT(frame.mSpData.get(), img, true);
   } else if (!frame.mMat.empty()) {
     img = frame.mMat;
@@ -289,7 +295,10 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
   // 维护回溯缓存（仅保存 Mat，必要时缩放到将来写入的尺寸）
   {
     cv::Mat cur;
-    if (obj->mFrame->mSpData) {
+    // 优先缓存 OSD 后的图像，确保预录也带框
+    if (obj->mFrame->mSpDataOsd) {
+      cv::bmcv::toMAT(obj->mFrame->mSpDataOsd.get(), cur, true);
+    } else if (obj->mFrame->mSpData) {
       cv::bmcv::toMAT(obj->mFrame->mSpData.get(), cur, true);
     } else if (!obj->mFrame->mMat.empty()) {
       cur = obj->mFrame->mMat;
