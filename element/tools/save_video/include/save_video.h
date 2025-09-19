@@ -143,7 +143,11 @@ class SaveVideo : public ::sophon_stream::framework::Element {
   // - 若未配置或为空，则使用检测到的 class_id 作为 type。
   std::optional<int> fixed_type_{};
   std::unordered_map<int,int> type_map_{};
+  bool use_class_id_type_ = false; // 显式配置使用检测到的 class_id 作为上报 type
   std::string video_url_field_ = "safetyUrl";
+
+  // 统一解析本次事件的 type
+  int resolveType(const std::vector<std::shared_ptr<common::DetectedObjectMetadata>>& dets) const;
 
   // 状态
   std::mutex mtx_;

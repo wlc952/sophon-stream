@@ -12,6 +12,7 @@
 #include <ctime>
 #include <iomanip>
 #include <regex>
+#include <sstream>
 
 #include "common/common_defs.h"
 #include "common/logger.h"
@@ -203,6 +204,12 @@ common::ErrorCode SaveVideo::initInternal(const std::string& json) {
   auto cfg = nlohmann::json::parse(json, nullptr, false);
   if (!cfg.is_object()) return common::ErrorCode::PARSE_CONFIGURE_FAIL;
 
+  // 处理嵌套的 "configure" 对象
+  if (cfg.contains("configure") && cfg["configure"].is_object()) {
+    cfg = cfg["configure"];  // 直接使用内层对象
+    IVS_INFO("save_video: using nested 'configure' object");
+  }
+
   // 基础配置
   if (cfg.contains(CONFIG_SERVER_URL)) server_url_ = cfg[CONFIG_SERVER_URL].get<std::string>();
   endpoint_ = parseUrl(server_url_);
@@ -229,8 +236,14 @@ common::ErrorCode SaveVideo::initInternal(const std::string& json) {
     const auto& tv = cfg[CONFIG_TYPE];
     if (tv.is_number_integer()) {
       fixed_type_ = tv.get<int>();
+      use_class_id_type_ = false;
+      type_map_.clear();
+      IVS_INFO("save_video: configured fixed_type = {0}", *fixed_type_);
     } else if (tv.is_object()) {
       // 解析 class_id -> type 的映射
+      fixed_type_.reset();
+      use_class_id_type_ = false;
+      type_map_.clear();
       for (auto it = tv.begin(); it != tv.end(); ++it) {
         try {
           int class_id = std::stoi(it.key());
@@ -241,9 +254,30 @@ common::ErrorCode SaveVideo::initInternal(const std::string& json) {
           // 非法键名忽略
         }
       }
+      std::stringstream ss;
+      ss << "save_video: type_map loaded {";
+      bool first = true;
+      for (auto &kv : type_map_) {
+        if (!first) ss << ", ";
+        first = false;
+        ss << kv.first << "->" << kv.second;
+      }
+      ss << "}";
+      IVS_INFO("{0}", ss.str());
+    } else if (tv.is_string()) {
+      std::string s = tv.get<std::string>();
+      if (s == "class_id" || s == "classid" || s == "label" ) {
+        // 显式指明使用检测到的第一个目标 class_id 作为 type
+        fixed_type_.reset();
+        type_map_.clear();
+        use_class_id_type_ = true;
+        IVS_INFO("save_video: configured use_class_id_type = true");
+      }
     } else {
-      // 空或不合规：保持两者为空，表示运行时取 class_id
+      IVS_WARN("save_video: unsupported type field format");
     }
+  } else {
+    IVS_INFO("save_video: no type field found, will use default class_id");
   }
   if (cfg.contains(CONFIG_VIDEO_URL_FIELD)) {
     video_url_field_ = cfg[CONFIG_VIDEO_URL_FIELD].get<std::string>();
@@ -350,28 +384,8 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
 #else
     localtime_r(&t, &tm);
 #endif
-  // 解析本次事件的 type：
-  int resolved_type = -1;
-    if (fixed_type_.has_value()) {
-      resolved_type = *fixed_type_;
-    } else if (!type_map_.empty()) {
-      // 从第一个检测目标的 class_id 映射
-      for (auto& det : obj->mDetectedObjectMetadatas) {
-        if (!det) continue;
-        int class_id = det->getLabel();
-        auto it = type_map_.find(class_id);
-        if (it != type_map_.end()) { resolved_type = it->second; break; }
-      }
-      if (resolved_type < 0 && !obj->mDetectedObjectMetadatas.empty()) {
-        resolved_type = obj->mDetectedObjectMetadatas.front()->getLabel();
-      }
-    } else {
-      // 默认使用 class_id
-      if (!obj->mDetectedObjectMetadatas.empty() && obj->mDetectedObjectMetadatas.front())
-        resolved_type = obj->mDetectedObjectMetadatas.front()->getLabel();
-    }
-
-  st.pending_type = resolved_type;
+    int resolved_type = resolveType(obj->mDetectedObjectMetadatas);
+    st.pending_type = resolved_type;
 
   // 生成包含 type 的文件名
   char timebuf[32];
@@ -431,6 +445,81 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
   }
 
   return common::ErrorCode::SUCCESS;
+}
+
+int SaveVideo::resolveType(const std::vector<std::shared_ptr<common::DetectedObjectMetadata>>& dets) const {
+  // 调试：打印检测到的所有 class_id 和相关信息
+  std::stringstream det_info;
+  det_info << "save_video: detected objects count=" << dets.size() << ", details=[";
+  bool first = true;
+  for (auto &d : dets) {
+    if (!d) {
+      if (!first) det_info << ",";
+      first = false;
+      det_info << "null";
+      continue;
+    }
+    if (!first) det_info << ",";
+    first = false;
+    int classify = d->mClassify;  // 使用 mClassify 而不是 getLabel()
+    int label = d->getLabel();    // getLabel() 基于 mTopKLabels
+    std::string labelName = d->mLabelName;
+    std::string classifyName = d->mClassifyName;
+    det_info << "{classify:" << classify << ",label:" << label << ",labelName:\"" << labelName << "\",classifyName:\"" << classifyName << "\"}";
+  }
+  det_info << "]";
+  IVS_INFO("{0}", det_info.str());
+
+  // 1. 固定值优先
+  if (fixed_type_.has_value()) {
+    IVS_INFO("save_video: using fixed_type = {0}", *fixed_type_);
+    return *fixed_type_;
+  }
+  // 2. 显式使用 class_id
+  if (use_class_id_type_) {
+    for (auto &d : dets) {
+      if (d && d->mClassify >= 0) {
+        int result = d->mClassify;
+        IVS_INFO("save_video: using class_id_type = {0}", result);
+        return result;
+      }
+    }
+    IVS_WARN("save_video: class_id_type mode but no valid detections, fallback to 0");
+    return 0; // 无检测则回退 0
+  }
+  // 3. 映射
+  if (!type_map_.empty()) {
+    for (auto &d : dets) {
+      if (!d) continue;
+      int cid = d->mClassify;  // 使用 mClassify 而不是 getLabel()
+      if (cid < 0) continue; // 跳过无效的 class_id
+      auto it = type_map_.find(cid);
+      if (it != type_map_.end()) {
+        IVS_INFO("save_video: mapped class_id {0} -> type {1}", cid, it->second);
+        return it->second;
+      }
+    }
+    // 未命中映射：若有有效检测对象，用第一个的 class_id
+    for (auto &d : dets) {
+      if (d && d->mClassify >= 0) {
+        int result = d->mClassify;
+        IVS_WARN("save_video: mapping miss, fallback to class_id {0}", result);
+        return result;
+      }
+    }
+    IVS_WARN("save_video: mapping mode but no valid detections (all mClassify < 0), fallback to 0");
+    return 0;
+  }
+  // 4. 未配置 type：使用第一个有效检测对象 class_id
+  for (auto &d : dets) {
+    if (d && d->mClassify >= 0) {
+      int result = d->mClassify;
+      IVS_INFO("save_video: default mode, using class_id {0}", result);
+      return result;
+    }
+  }
+  IVS_WARN("save_video: no detections and no fixed type, fallback to 0");
+  return 0;
 }
 
 REGISTER_WORKER("save_video", SaveVideo)
