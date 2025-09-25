@@ -33,6 +33,10 @@
             },
             {
                 "element_id": 5002,
+                "element_config": "../yolov5/config_2/osd.json"
+            },
+            {
+                "element_id": 5003,
                 "element_config": "../yolov5/config_2/save_video.json",
                 "ports": {
                     "output": [
@@ -56,6 +60,12 @@
                 "src_element_id": 5001,
                 "src_port": 0,
                 "dst_element_id": 5002,
+                "dst_port": 0
+            },
+            {
+                "src_element_id": 5002,
+                "src_port": 0,
+                "dst_element_id": 5003,
                 "dst_port": 0
             }
         ]

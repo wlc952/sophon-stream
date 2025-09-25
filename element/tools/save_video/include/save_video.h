@@ -23,7 +23,7 @@
 #include <algorithm>
 #include <thread>
 #include <vector>
-#include <deque>
+#include <unordered_set>
 
 #include "common/logger.h"
 #include "common/object_metadata.h"
@@ -53,20 +53,20 @@ struct ChannelState {
   int width = 0;
   int height = 0;
 
-  // 报警数据
-  std::string pending_img_path;
+  // 当前录像段共享视频路径
   std::string pending_video_path;
-  std::chrono::system_clock::time_point event_time;
-  bool report_scheduled = false;  // 等待视频写完再上报
-  int pending_type = -1;          // 触发事件解析得到的type
+  // 新增：连续命中计数
+  std::unordered_map<int,int> per_class_consecutive_frames; // 按类别统计
 
-  // 限流
-  std::chrono::steady_clock::time_point last_trigger_tp =
-      std::chrono::steady_clock::time_point::min();
-
-  // 回溯缓存（最近 N 秒帧）
-  std::deque<cv::Mat> pre_buffer;
-  int pre_buf_max = 0;  // 最大帧数（pre_record_seconds * fps）
+  // 多事件聚合：一个录像段内允许多个不同类别事件，共享同一视频
+  struct PendingEvent {
+    int class_id;               // 事件对应类别
+    int type;                   // 解析得到的上报 type
+    std::string img_path;       // 快照路径
+    std::string datetime_str;   // 上报时间字符串（YYYY-MM-DD HH:MM:SS）
+  };
+  std::vector<PendingEvent> pending_events;          // 本段累计的事件
+  std::unordered_set<int>   suppressed_classes;       // 已经触发过的类别（本段内不再重复）
 };
 
 class SaveVideo : public ::sophon_stream::framework::Element {
@@ -82,8 +82,6 @@ class SaveVideo : public ::sophon_stream::framework::Element {
   static constexpr const char* CONFIG_SAVE_DIR = "save_dir";             // 根目录
   static constexpr const char* CONFIG_BASE_FILE_URL = "base_file_url";   // 用于拼接返回URL，可为空
   static constexpr const char* CONFIG_RECORD_SECONDS = "record_seconds"; // 默认10
-  static constexpr const char* CONFIG_PRE_RECORD_SECONDS = "pre_record_seconds"; // 触发前回溯秒数，默认0
-  static constexpr const char* CONFIG_COOLDOWN_SECONDS = "cooldown_seconds"; // 触发冷却，默认10
   static constexpr const char* CONFIG_TRIGGER_CLASSES = "trigger_classes";   // 为空则任意目标
 
   // 存储清理
@@ -122,8 +120,6 @@ class SaveVideo : public ::sophon_stream::framework::Element {
   std::string save_dir_;
   std::string base_file_url_;
   int record_seconds_ = 10;
-  int pre_record_seconds_ = 0;
-  int cooldown_seconds_ = 10;
   std::vector<std::string> trigger_classes_;
 
   // 存储清理配置
@@ -145,6 +141,10 @@ class SaveVideo : public ::sophon_stream::framework::Element {
   std::unordered_map<int,int> type_map_{};
   bool use_class_id_type_ = false; // 显式配置使用检测到的 class_id 作为上报 type
   std::string video_url_field_ = "safetyUrl";
+  // 触发连续帧阈值配置
+  static constexpr const char* CONFIG_MIN_TRIGGER_FRAMES = "min_trigger_frames"; // int | object
+  int global_min_trigger_frames_ = 1; // 默认 1（修改：原默认5）
+  std::unordered_map<int,int> per_class_min_trigger_frames_; // class_id -> threshold
 
   // 统一解析本次事件的 type
   int resolveType(const std::vector<std::shared_ptr<common::DetectedObjectMetadata>>& dets) const;

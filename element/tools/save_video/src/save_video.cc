@@ -15,6 +15,7 @@
 #include <sstream>
 
 #include "common/common_defs.h"
+#include <unordered_set>
 #include "common/logger.h"
 #include "element_factory.h"
 
@@ -91,7 +92,7 @@ bool SaveVideo::startRecording(int channel, const common::Frame& frame, const st
     st.width = w;
     st.height = h;
     st.fps = fps;
-    st.pre_buf_max = std::max(0, pre_record_seconds_ * fps);
+  // （预录功能已移除，不再计算预录缓存大小）
 
     st.writer = std::make_unique<cv::VideoWriter>();
   // MP4 容器更推荐使用 'avc1' FourCC，避免 OpenCV/FFmpeg 警告并保持 H.264 编码
@@ -217,9 +218,30 @@ common::ErrorCode SaveVideo::initInternal(const std::string& json) {
   save_dir_ = cfg[CONFIG_SAVE_DIR].get<std::string>();
   if (cfg.contains(CONFIG_BASE_FILE_URL)) base_file_url_ = cfg[CONFIG_BASE_FILE_URL].get<std::string>();
   if (cfg.contains(CONFIG_RECORD_SECONDS)) record_seconds_ = std::max(1, cfg[CONFIG_RECORD_SECONDS].get<int>());
-  if (cfg.contains(CONFIG_PRE_RECORD_SECONDS)) pre_record_seconds_ = std::max(0, cfg[CONFIG_PRE_RECORD_SECONDS].get<int>());
-  if (cfg.contains(CONFIG_COOLDOWN_SECONDS)) cooldown_seconds_ = std::max(0, cfg[CONFIG_COOLDOWN_SECONDS].get<int>());
+
   if (cfg.contains(CONFIG_TRIGGER_CLASSES)) trigger_classes_ = cfg[CONFIG_TRIGGER_CLASSES].get<std::vector<std::string>>();
+  // 连续帧阈值解析（默认值已在头文件成员初始化中为 1，这里仅解析配置覆盖）
+  per_class_min_trigger_frames_.clear();
+  if (cfg.contains(CONFIG_MIN_TRIGGER_FRAMES)) {
+    const auto &mtf = cfg[CONFIG_MIN_TRIGGER_FRAMES];
+    if (mtf.is_number_integer()) {
+      global_min_trigger_frames_ = std::max(1, mtf.get<int>());
+      IVS_INFO("save_video: global min_trigger_frames = {0}", global_min_trigger_frames_);
+    } else if (mtf.is_object()) {
+      for (auto it = mtf.begin(); it != mtf.end(); ++it) {
+        try {
+          int cid = std::stoi(it.key());
+          if (it.value().is_number_integer()) {
+            int thr = std::max(1, it.value().get<int>());
+            per_class_min_trigger_frames_[cid] = thr;
+          }
+        } catch (...) {}
+      }
+      if (!per_class_min_trigger_frames_.empty()) {
+        std::stringstream ss; ss << "save_video: per-class min_trigger_frames {"; bool first=true; for (auto &kv: per_class_min_trigger_frames_) { if(!first) ss << ", "; first=false; ss<<kv.first<<"->"<<kv.second; } ss << "}, default=" << global_min_trigger_frames_; IVS_INFO("{0}", ss.str());
+      }
+    }
+  }
 
   // 存储清理
   if (cfg.contains(CONFIG_RETENTION_DAYS)) retention_days_ = std::max(0, cfg[CONFIG_RETENTION_DAYS].get<int>());
@@ -326,34 +348,7 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
   // 这是有效帧，确保不被统计逻辑过滤
   obj->mFilter = false;
 
-  // 维护回溯缓存（仅保存 Mat，必要时缩放到将来写入的尺寸）
-  {
-    cv::Mat cur;
-    // 优先缓存 OSD 后的图像，确保预录也带框
-    if (obj->mFrame->mSpDataOsd) {
-      cv::bmcv::toMAT(obj->mFrame->mSpDataOsd.get(), cur, true);
-    } else if (obj->mFrame->mSpData) {
-      cv::bmcv::toMAT(obj->mFrame->mSpData.get(), cur, true);
-    } else if (!obj->mFrame->mMat.empty()) {
-      cur = obj->mFrame->mMat;
-    }
-    if (!cur.empty()) {
-      if (st.width > 0 && st.height > 0 && (cur.cols != st.width || cur.rows != st.height)) {
-        cv::Mat resized;
-        cv::resize(cur, resized, cv::Size(st.width, st.height));
-        st.pre_buffer.emplace_back(std::move(resized));
-      } else {
-        st.pre_buffer.emplace_back(cur.clone());
-      }
-      if (st.pre_buf_max > 0) {
-        while ((int)st.pre_buffer.size() > st.pre_buf_max) st.pre_buffer.pop_front();
-      } else {
-        // 没有预录要求则限制一个较小上限，避免无限增长
-        const int soft_cap = 50;  // 约2秒@25fps
-        while ((int)st.pre_buffer.size() > soft_cap) st.pre_buffer.pop_front();
-      }
-    }
-  }
+  // （预录功能已移除，不再维护回溯帧缓存）
 
   // 条件：检测到目标（若 trigger_classes_ 非空，则类别需匹配）
   auto hasTarget = [&]() {
@@ -372,9 +367,57 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
   }();
 
   auto now_tp = steady_clock::now();
-  bool cooldown_ok = st.last_trigger_tp == steady_clock::time_point::min() || (now_tp - st.last_trigger_tp) >= seconds(cooldown_seconds_);
+  // 冷却机制已移除
 
-  if (hasTarget && cooldown_ok && !st.recording) {
+  // 连续帧统计（仅按类别）：记录“本帧首次达到阈值且尚未被抑制”的类别
+  std::vector<int> newly_reached_classes;
+
+  if (hasTarget) {
+    // 按类别：同一帧同一个 class_id 只计一次
+    std::unordered_set<int> frame_class_ids;
+    frame_class_ids.reserve(obj->mDetectedObjectMetadatas.size());
+    for (auto &det : obj->mDetectedObjectMetadatas) {
+      if (!det) continue; int cid = det->mClassify; if (cid < 0) continue;
+      frame_class_ids.insert(cid);
+    }
+    for (int cid : frame_class_ids) {
+      auto &cnt = st.per_class_consecutive_frames[cid];
+      int prev = cnt;
+      cnt++;
+      int need = global_min_trigger_frames_;
+      auto itThr = per_class_min_trigger_frames_.find(cid);
+      if (itThr != per_class_min_trigger_frames_.end()) need = itThr->second;
+      // 仅在首次达到阈值且该类别尚未被段内抑制时记录
+      if (cnt >= need && prev < need && st.suppressed_classes.count(cid)==0) {
+        newly_reached_classes.push_back(cid);
+      }
+    }
+      // 严格连续语义：本帧缺失的已存在类别计数归零（下一次再出现重新累计）
+      if (!st.per_class_consecutive_frames.empty()) {
+        for (auto &kv : st.per_class_consecutive_frames) {
+          int cid_existing = kv.first;
+          if (frame_class_ids.find(cid_existing) == frame_class_ids.end()) {
+            kv.second = 0; // 缺失即断裂
+          }
+        }
+      }
+  } else {
+    // 无目标：清空按类别计数
+    st.per_class_consecutive_frames.clear();
+  }
+  // 仅当有“新首次达到阈值”的类别时触发
+  if (!newly_reached_classes.empty()) {
+    // 触发前调试日志：打印达到阈值的类别以及当前全部计数
+    {
+      std::stringstream ssAll;
+  ssAll << "save_video trigger per={";
+      bool first=true; for (auto &kv: st.per_class_consecutive_frames) { if(!first) ssAll<<","; first=false; ssAll<<kv.first<<":"<<kv.second; }
+      ssAll << "} fired={";
+      for (size_t i=0;i<newly_reached_classes.size();++i){ if(i) ssAll<<","; ssAll<<newly_reached_classes[i]; }
+      ssAll << "}";
+      IVS_INFO("{0}", ssAll.str());
+    }
+    // 不再截断当前录像：若已在录制，只追加事件
     // 生成文件名：save_dir/channel_#/YYYYmmdd_HHMMSS
     auto now_sys = system_clock::now();
     std::time_t t = system_clock::to_time_t(now_sys);
@@ -384,8 +427,10 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
 #else
     localtime_r(&t, &tm);
 #endif
-    int resolved_type = resolveType(obj->mDetectedObjectMetadatas);
-    st.pending_type = resolved_type;
+  int resolved_type = resolveType(obj->mDetectedObjectMetadatas);
+
+  // 多类别同时触发：全部记录；首个类别用于主命名（base.jpg）
+  int primary_class = newly_reached_classes.empty() ? -1 : newly_reached_classes.front();
 
   // 生成包含 type 的文件名
   char timebuf[32];
@@ -393,26 +438,73 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
   std::string timestr(timebuf);
   std::string base_name = timestr + "_type" + std::to_string(resolved_type);
   std::string base = (fs::path(save_dir_) / ("ch_" + std::to_string(ch)) / base_name).string();
-  std::string imgPath = base + ".jpg";
-  std::string vidPath = base + ".mp4";
+    std::vector<int> classes_to_add; // 本次真正需要记录的类别（去除已抑制）
+    for (int cid : newly_reached_classes) {
+      if (cid >= 0 && st.suppressed_classes.count(cid)) continue; // 已记录
+      classes_to_add.push_back(cid);
+    }
 
-    // 保存快照
-    saveSnapshot(*obj->mFrame, imgPath);
-
-    // 开始录像
-    if (startRecording(ch, *obj->mFrame, vidPath)) {
-      // 先把预录缓存写入
-      if (!st.pre_buffer.empty()) {
-        for (auto& m : st.pre_buffer) {
-          if (st.writer) st.writer->write(m);
+    std::string vidPath;
+    if (!st.recording) {
+      vidPath = base + ".mp4";
+      bool record_ok = startRecording(ch, *obj->mFrame, vidPath);
+  st.pending_video_path = vidPath;
+      st.pending_events.clear();
+      st.suppressed_classes.clear();
+      if (!record_ok) {
+        // 录像失败：按类别直接上报（共享一张主图片）
+        std::string mainImg = base + ".jpg";
+        saveSnapshot(*obj->mFrame, mainImg);
+        char dtbuf[32]; std::strftime(dtbuf, sizeof(dtbuf), "%Y-%m-%d %H:%M:%S", &tm);
+        for (int cid : classes_to_add) {
+          ChannelState::PendingEvent ev{cid, resolved_type, mainImg, dtbuf};
+          postAlarm(ch, ev.img_path, "", ev.datetime_str, ev.type);
+        }
+  // 无录像句柄，无需后续段结束批量上报
+      } else {
+        // 成功开始录像：为每个类别生成快照
+        {
+          std::stringstream ss;
+          ss << "save_video: segment start video=" << vidPath << " classes=";
+          bool first = true;
+          for (int cid : classes_to_add) { if(!first) ss << ","; first=false; ss << cid; }
+          ss << " type=" << resolved_type;
+          IVS_INFO("{0}", ss.str());
+        }
+        int idx = 0;
+        for (int cid : classes_to_add) {
+          std::string imgPath;
+          if (idx == 0) {
+            imgPath = base + ".jpg"; // 主文件名
+          } else {
+            // 统一命名以 type 结尾：时间 + _cls<cid>_type<type>.jpg
+            imgPath = (fs::path(save_dir_) / ("ch_" + std::to_string(ch)) / (timestr + "_cls" + std::to_string(cid) + "_type" + std::to_string(resolved_type) + ".jpg")).string();
+          }
+          saveSnapshot(*obj->mFrame, imgPath);
+          char dtbuf[32]; std::strftime(dtbuf, sizeof(dtbuf), "%Y-%m-%d %H:%M:%S", &tm);
+          ChannelState::PendingEvent ev{cid, resolved_type, imgPath, dtbuf};
+          st.pending_events.push_back(std::move(ev));
+          st.suppressed_classes.insert(cid);
+          ++idx;
         }
       }
+    } else {
+      vidPath = st.pending_video_path; // 共享视频
+      int idx = 0;
+      for (int cid : classes_to_add) {
+        std::string imgPath;
+        // 统一命名以 type 结尾：时间 + _cls<cid>_type<type>.jpg
+        imgPath = (fs::path(save_dir_) / ("ch_" + std::to_string(ch)) / (timestr + "_cls" + std::to_string(cid) + "_type" + std::to_string(resolved_type) + ".jpg")).string();
+        saveSnapshot(*obj->mFrame, imgPath);
+        char dtbuf[32]; std::strftime(dtbuf, sizeof(dtbuf), "%Y-%m-%d %H:%M:%S", &tm);
+        ChannelState::PendingEvent ev{cid, resolved_type, imgPath, dtbuf};
+        st.pending_events.push_back(std::move(ev));
+        st.suppressed_classes.insert(cid);
+        ++idx;
+      }
     }
-    st.pending_img_path = imgPath;
-    st.pending_video_path = vidPath;
-    st.event_time = now_sys;
-    st.report_scheduled = true;  // 等录像结束后发送
-    st.last_trigger_tp = now_tp;
+
+    // 不再清零计数：保持计数防止阈值=1 类别因清零再次重复触发（抑制由 suppressed_classes 保证）
   }
 
   // 录像续写与结束
@@ -420,20 +512,38 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
     appendFrame(ch, *obj->mFrame);
     if (now_tp >= st.record_end_tp) {
       stopRecording(ch);
-      if (st.report_scheduled) {
-        // 时间格式
-        auto t = system_clock::to_time_t(st.event_time);
-        std::tm tm{};
-#ifdef _WIN32
-        localtime_s(&tm, &t);
-#else
-        localtime_r(&t, &tm);
-#endif
-        char buf[32];
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
-  postAlarm(ch, st.pending_img_path, st.pending_video_path, buf, st.pending_type);
-        st.report_scheduled = false;
+      // 结束时批量上报本段的所有事件（共享视频路径）
+      if (st.pending_events.empty()) {
+        // 无事件：删除空段视频，避免产生“无告警视频”与后续 HTTP 数量难以对齐
+        if (!st.pending_video_path.empty()) {
+          std::error_code ec_rm;
+          std::filesystem::remove(st.pending_video_path, ec_rm);
+          if (!ec_rm) {
+            IVS_INFO("save_video: segment end (no events) removed video={0}", st.pending_video_path);
+          } else {
+            IVS_WARN("save_video: segment end (no events) remove failed video={0}", st.pending_video_path);
+          }
+        }
+      } else {
+        // 汇总日志（在逐条上报之前打印）
+        {
+          std::stringstream ss;
+          ss << "save_video: segment end video=" << st.pending_video_path << " events=" << st.pending_events.size() << " [";
+          bool first=true;
+          for (auto &ev: st.pending_events) {
+            if (!first) ss << ","; first=false;
+            ss << "{cls=" << ev.class_id << ",type=" << ev.type << "}";
+          }
+          ss << "]";
+          IVS_INFO("{0}", ss.str());
+        }
+        for (auto &ev : st.pending_events) {
+          postAlarm(ch, ev.img_path, st.pending_video_path, ev.datetime_str, ev.type);
+          IVS_INFO("save_video: posted event cls={0} type={1} img={2}", ev.class_id, ev.type, ev.img_path);
+        }
       }
+      st.pending_events.clear();
+      st.suppressed_classes.clear();
     }
   }
 
@@ -448,31 +558,10 @@ common::ErrorCode SaveVideo::doWork(int dataPipeId) {
 }
 
 int SaveVideo::resolveType(const std::vector<std::shared_ptr<common::DetectedObjectMetadata>>& dets) const {
-  // 调试：打印检测到的所有 class_id 和相关信息
-  std::stringstream det_info;
-  det_info << "save_video: detected objects count=" << dets.size() << ", details=[";
-  bool first = true;
-  for (auto &d : dets) {
-    if (!d) {
-      if (!first) det_info << ",";
-      first = false;
-      det_info << "null";
-      continue;
-    }
-    if (!first) det_info << ",";
-    first = false;
-    int classify = d->mClassify;  // 使用 mClassify 而不是 getLabel()
-    int label = d->getLabel();    // getLabel() 基于 mTopKLabels
-    std::string labelName = d->mLabelName;
-    std::string classifyName = d->mClassifyName;
-    det_info << "{classify:" << classify << ",label:" << label << ",labelName:\"" << labelName << "\",classifyName:\"" << classifyName << "\"}";
-  }
-  det_info << "]";
-  IVS_INFO("{0}", det_info.str());
+  // 移除高频调试日志：仅保留必要决策日志（映射命中/回退警告等）
 
   // 1. 固定值优先
   if (fixed_type_.has_value()) {
-    IVS_INFO("save_video: using fixed_type = {0}", *fixed_type_);
     return *fixed_type_;
   }
   // 2. 显式使用 class_id
@@ -480,7 +569,6 @@ int SaveVideo::resolveType(const std::vector<std::shared_ptr<common::DetectedObj
     for (auto &d : dets) {
       if (d && d->mClassify >= 0) {
         int result = d->mClassify;
-        IVS_INFO("save_video: using class_id_type = {0}", result);
         return result;
       }
     }

@@ -1,6 +1,6 @@
 {
     "configure": {
-        "model_path": "/data/8models/触摸方向盘0827/yolov5s_tpukernel_fp16_1b.bmodel",
+        "model_path": "/data/8models/踩刹车0825/yolov5s_tpukernel_fp16_1b.bmodel",
         "threshold_conf": 0.5,
         "threshold_nms": 0.5,
         "bgr2rgb": true,

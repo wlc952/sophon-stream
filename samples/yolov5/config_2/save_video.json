@@ -4,8 +4,6 @@
     "save_dir": "/data/alarms",
     "base_file_url": "http://127.0.0.1/static", 
     "record_seconds": 10,
-    "pre_record_seconds": 0,
-    "cooldown_seconds": 10,
     "retention_days": 1,
     "retention_max_gb": 1,
     "cleanup_interval_seconds": 300,
@@ -15,7 +13,20 @@
     "safetyName": "安全员1",
     "warning": "way",
     "video_url_field": "safetyUrl",
-    "type": 2
+    "type": {
+      "0": 10,
+      "1": 2,
+      "2": 6,
+      "3": 5,
+      "4": 5,
+      "5": 3,
+      "6": 4
+    },
+    "min_trigger_frames": {
+      "0": 20,
+      "1": 5,
+      "2": 1
+    }
   },
   "shared_object": "../../build/lib/libsave_video.so",
   "name": "save_video",
